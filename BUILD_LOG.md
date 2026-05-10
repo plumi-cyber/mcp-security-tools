@@ -392,3 +392,421 @@ my tools reach out to in the real world.
 This is the same shape PointClickCare's agentic SOC platform uses — substitute
 "Claude" with their agent runtime, substitute my two tools with their dozens
 of security integrations.
+---
+
+## Evening 2 — Build Log
+
+**Goal:** replace the placeholder `hello` tool with two real ones, get the
+end-to-end agent investigation working, ship the README and push the public
+GitHub repo.
+
+**Time spent:** ~5 hours (longer than evening 1 because the agent demo had a
+non-obvious failure mode that required reasoning about filesystem boundaries
+between the agent and the MCP server).
+
+### Phase 1 — Build the auth log parser tool
+
+#### Sample data design
+
+The sample auth log isn't arbitrary — it's hand-crafted with five distinct
+attack patterns chosen to demonstrate tiered SOC reasoning:
+
+| Pattern | Source IP | Shape | Why it's here |
+|---|---|---|---|
+| Successful credential compromise | 103.211.18.97 | 5 rapid failures, then 1 success on a real user (`lumi`) | Highest priority: the line between attempted and confirmed breach |
+| Aggressive brute force | 185.220.101.42 | 8 failures in 21 seconds, cycling 5 admin-style usernames | High volume but typically blocked by rate limits; Tor exit node |
+| Username spray | 45.155.205.233 | 3 failures testing `test`, `user`, `guest` | Opportunistic probing, lower priority |
+| Quiet probe | 91.240.118.222 | 2 admin-targeted failures spaced ~7 seconds apart | Reconnaissance |
+| Normal traffic | 192.168.1.45, .1.62 | Successful logins from internal IPs | Noise — should be filtered out |
+
+The point: with this data, an agent that just sorts by attempt count produces
+the wrong triage. The credential compromise has only 5 attempts but is the
+most serious finding. A good agent has to reason about *patterns*, not just
+*counts*. By engineering the data this way, the demo proves the agent is
+doing more than running aggregations.
+
+#### The parser implementation
+
+Core approach: regex pattern-match `Failed password` lines, group by source
+IP, return sorted by attempt count descending.
+
+```python
+FAILED_LOGIN_PATTERN = re.compile(
+    r"Failed password for (?:invalid user )?(?P<user>\S+) from (?P<ip>\d+\.\d+\.\d+\.\d+)"
+)
+```
+
+Reading the regex left to right:
+- `Failed password for` — literal
+- `(?:invalid user )?` — optionally consume "invalid user " without capturing it
+- `(?P<user>\S+)` — capture the username into a named group
+- ` from ` — literal
+- `(?P<ip>\d+\.\d+\.\d+\.\d+)` — capture an IPv4 address
+
+Named groups (`(?P<name>...)`) are easier to read at the call site than
+positional capture groups. Worth the slight extra syntax.
+
+#### Why a regex and not string splitting
+
+Auth log lines vary — some have "invalid user," some don't, extra fields can
+appear. A regex pins down the exact shape and ignores everything else. It's
+also the same skill used in production SIEM tools — Splunk's `rex` command,
+Sentinel's KQL `parse` operator, Elastic's grok patterns are all regex
+variants. Different syntax, same mental model.
+
+#### Conceptual choices in the function shape
+
+- **`defaultdict` instead of manual dict initialization** — saves an
+  if-key-exists check on every line.
+- **Sets for usernames, converted to sorted lists at output** — sets
+  auto-deduplicate; lists are JSON-serializable for MCP transport.
+- **First/last seen timestamps** — frame the attack window; lets the agent
+  reason about timing density (8 attempts in 21 seconds vs 8 attempts over
+  a day means very different things).
+- **Sort by attempt count descending** — noisiest sources surface first in
+  the agent's view.
+
+#### Standalone testing
+
+Tested in a Python REPL (`from server import parse_auth_log`) before touching
+MCP. Output:
+
+- Total failed attempts: 18 ✓
+- Unique source IPs: 4 (the four attacking IPs; internal IPs from successful
+  logins are correctly excluded)
+- 185.220.101.42 leading with 8 attempts cycling 5 usernames ✓
+- 103.211.18.97 with 5 attempts targeting only `lumi` ✓
+
+**Debugging principle reinforced:** test each piece in isolation before wiring
+pieces together. If the demo fails later, you immediately know whether the
+problem is in the tool or in the integration. Skipping standalone testing
+turns one easy bug into two compound bugs.
+
+### Phase 2 — Build the AbuseIPDB tool
+
+#### Secrets management
+
+Created two files together: `.env` (the secret) and `.gitignore` (Git's
+blocklist that includes `.env`).
+
+The pattern: secrets in `.env`, code reads them via `python-dotenv`, `.env`
+is in `.gitignore` so it never gets committed. Anyone cloning the repo gets
+the *code* that reads the secret, never the secret itself.
+
+Why this matters concretely: bots scan public GitHub commits continuously for
+exposed API keys. Average exposure-to-abuse window for an AWS key is under 60
+seconds. AbuseIPDB keys are less catastrophic, but the habit of using
+`.env` + `.gitignore` from day one means the same instinct kicks in on a more
+sensitive project later.
+
+The `.env.example` template gets committed (with a placeholder value) so
+people cloning the repo know what variables they need to set without seeing
+the real key.
+
+#### The API wrapper pattern
+
+`check_ip_reputation` is a textbook example of an API wrapper. The pattern is
+universal across security tooling — VirusTotal, Shodan, GreyNoise, Splunk's
+REST API, Sentinel's KQL endpoint, ServiceNow incidents. Same shape every
+time:
+
+1. Authenticate (header or query param).
+2. Make the request inside a try/except, with a timeout.
+3. Check the status code: handle known error cases (auth, rate limit) with
+   specific messages; fall through to a generic message for everything else.
+4. Parse the JSON response.
+5. Reshape into a clean dict with only the fields the caller cares about.
+
+Defensive error handling at the API boundary is non-negotiable. If the tool
+crashes, Claude Desktop disconnects from the entire MCP server — losing
+access to *both* tools, not just the broken one. Returning a clean error dict
+keeps the rest of the system functional.
+
+#### Standalone testing
+
+Three test cases, each chosen deliberately:
+
+| Test | Input | Expected | Result |
+|---|---|---|---|
+| Known malicious | 185.220.101.42 (Tor exit node) | High abuse score, `is_tor: true` | Score 95, is_tor true, ISP literally "Network for Tor-Exit traffic" ✓ |
+| Known benign | 8.8.8.8 (Google DNS) | Score 0 or near zero | Score 0, ISP "Google LLC" ✓ |
+| Bad input | `"not-an-ip"` | Clean error dict, no crash | HTTP 422 caught by generic status branch, returned error dict ✓ |
+
+The three cases together prove: malicious IPs are correctly identified, benign
+IPs aren't false-flagged, and the tool degrades gracefully on bad input rather
+than killing the server.
+
+### Phase 3 — Agent demo
+
+#### Restart procedure
+
+Claude Desktop loads the MCP server as a subprocess at startup. Replacing
+`server.py` doesn't update the running subprocess — needed a full restart via
+Task Manager (same Microsoft Store sandbox issue from evening 1: the system
+tray "Quit" doesn't always actually quit).
+
+After restart, Settings → Developer → Local MCP servers showed `security-tools`
+running with the updated tool count.
+
+#### The connector toggle is per-chat
+
+First gotcha: enabling the `security-tools` connector in one chat doesn't
+carry over to a new chat. Each chat starts with connectors at default state,
+which appears to be "off" for newly-installed local MCP servers.
+
+Diagnosed by sending a "list every tool you have access to" prompt — the
+agent's answer revealed which servers were active. Once that distinction was
+clear, the fix was to flip the connector toggle on at the start of each new
+investigation chat.
+
+For demo purposes, also disabled Google Drive, Indeed, and Claude in Chrome
+connectors so the agent's behavior in the recording is clean — every action
+has to come from the project's two tools.
+
+#### The non-obvious failure mode: agent vs. tool filesystem
+
+First investigation prompt failed in an interesting way. The prompt referenced
+`sample_data/auth.log`. The agent's response: *"No project folder is
+accessible to me here... nothing was uploaded to this chat... `/mnt/user-data/
+uploads/` has no files."*
+
+The agent didn't even try to call `parse_auth_log`. It reasoned about the
+path, concluded it referred to the agent's own sandboxed code-execution
+environment (which was empty), and gave up.
+
+This is a real conceptual point worth understanding:
+
+- **Claude has its own sandbox** for the code-execution capability — a
+  filesystem at `/mnt/user-data/...` that's separate from the user's machine.
+- **MCP servers run as local subprocesses on the user's machine** — they see
+  the user's actual filesystem.
+- These are two different filesystems. A path can exist in one and not the
+  other.
+
+The agent was conflating "I can't see this from my sandbox" with "the MCP
+tool can't see this either" — being overly cautious by checking with its
+built-in filesystem tools rather than just calling the MCP tool.
+
+#### The fix
+
+Re-prompted with an explicit instruction:
+
+> Call the parse_auth_log tool with this exact absolute path:
+> C:\\Users\\pelum\\projects\\mcp-security-tools\\sample_data\\auth.log
+>
+> This file lives on my local Windows filesystem. The security-tools MCP
+> server runs as a subprocess on my machine and can read it. Don't check via
+> your built-in filesystem tools — call the MCP tool directly.
+
+After this, the agent correctly:
+- Acknowledged its earlier reasoning error explicitly
+- Called `parse_auth_log` with the absolute path
+- Got the four IPs back
+- Called `check_ip_reputation` four times — once per IP
+- Synthesized a tiered triage report
+
+#### The output
+
+Better than I expected. The agent produced analyst-level reasoning, not just
+data summarization:
+
+- **Critical:** flagged 103.211.18.97 highest priority despite the lowest
+  abuse score, because it spotted that `lumi` isn't a generic-wordlist
+  username (it's part of `pelumi` — a real account on this box). It correctly
+  inferred this is targeted reconnaissance, not opportunistic scanning, and
+  noted that a clean abuse score actually makes this *worse* — suggests
+  either a careful operator or a freshly-compromised residential proxy.
+- **High:** correctly downgraded 185.220.101.42 (the highest-volume attacker)
+  from critical because Tor exits hit every internet-facing SSH server
+  constantly — "background radiation of the internet."
+- **Medium:** identified 45.155.205.233 as opportunistic spray.
+- **Low:** noted that 91.240.118.222 should go on a watchlist rather than
+  immediate-block — "clean reputation means firewall noise without much
+  benefit."
+
+Plus cross-cutting recommendations the agent generated unprompted: fail2ban
+tuning with specific values, AllowUsers SSH directive, snapshot the log to
+evidence storage before rotation eats the day's data.
+
+#### Honest limitation surfaced
+
+The agent flagged a real gap: `parse_auth_log` only returns failed events, so
+it couldn't definitively confirm whether suspicious IPs eventually succeeded.
+The agent ended its triage with: *"Tell me what the Accepted-line query
+returns and I'll adjust the tiering."*
+
+That's actually the system working correctly — recognizing it needs more data
+rather than guessing. Documented in the README's roadmap section as an
+intentional v1 scope decision: keep tools narrow so the agent has to chain
+queries, which is exactly the pattern production SOC tools require.
+
+### Phase 4 — README, GitHub push
+
+#### README design
+
+Optimized for the fold. First ~150 lines are what a hiring manager scanning
+fast actually sees. Demo screenshots above the fold so anyone passing through
+sees "this works" before they see "this is what it's for."
+
+No specific company named in the README — framing is generic ("agentic SOC
+platforms") so the same artifact serves every application. Targeted framing
+goes in interview conversations, not in the public repo.
+
+The Roadmap section explicitly frames the parser limitation as *intentional v1
+scope decisions, not bugs*. Hiring managers read roadmap sections to assess
+engineering judgment more than to verify completeness — they expect v1 to be
+incomplete.
+
+#### Repo hygiene files
+
+- `requirements.txt` via `pip freeze` — pins exact dependency versions for
+  reproducibility.
+- `.env.example` — template showing required environment variables.
+- `LICENSE` (MIT) — standard permissive license; what most portfolio repos use.
+
+#### Git workflow
+
+Standard sequence:
+
+```
+git config --global user.name "..."
+git config --global user.email "..."
+git init
+git add .
+git status   # verify .env is NOT in the staged list
+git branch -m main
+git commit -m "Initial commit: ..."
+git remote add origin https://github.com/plumi-cyber/mcp-security-tools.git
+git push -u origin main
+```
+
+The critical safety check: `git status` before any `git commit`, every time.
+If `.env` ever appears in the staged list, the `.gitignore` is broken and
+committing would expose the API key to history. Cleaning a secret out of Git
+history is painful — better to catch it at the staging step.
+
+GitHub created the repo with a capitalized name (`MCP-Security-Tools`) by
+default; renamed to lowercase (`mcp-security-tools`) via Settings to match
+the convention every other repo in the ecosystem uses.
+
+### Conceptual learnings consolidated (Evening 2)
+
+#### 1. The agent's filesystem is not the same as the tool's filesystem
+
+This was the trickiest concept of the night. AI agents that have code
+execution capability run in their own isolated sandbox. MCP servers run as
+local subprocesses on the user's machine. Those are two different
+filesystems. When you give the agent a path, it has to decide which
+filesystem you mean — and may guess wrong.
+
+The fix isn't just "use absolute paths" — it's to make the relationship
+between the agent's context and the tool's context explicit in your prompt.
+Production agentic systems handle this by binding tools to specific contexts
+at registration time so the agent can't get confused.
+
+#### 2. Tool design forces or prevents agent chaining
+
+A tool that returns everything at once short-circuits the agent's reasoning.
+A tool that returns one slice forces the agent to run follow-up queries.
+SOC platforms deliberately split tools (failures vs. successes, alerts vs.
+events, raw logs vs. enriched data) because narrow tools produce more
+demonstrable agent reasoning — and easier human auditing.
+
+#### 3. Defensive error handling is the boundary, not the inside
+
+Inside the function, raising an exception is fine — it forces fast feedback
+during development. At the boundary (where the function returns to MCP, the
+API, the user), exceptions become silent failures of the whole system.
+Catch them at the boundary, return clean error dicts, let everything else
+keep working.
+
+#### 4. Type hints are a free productivity multiplier
+
+Every type hint you write becomes part of the tool's schema for the AI agent.
+Sparse hints → agent uses tools poorly. Rich hints → agent uses tools well.
+This shifts the cost-benefit of writing thorough type annotations: in normal
+Python they're optional documentation; in MCP servers they're machine-readable
+contracts that directly affect agent performance.
+
+#### 5. Connector state is per-chat, not global
+
+A subtle UX detail in Claude Desktop: connector toggles reset per-chat. For
+demo recording, this means flipping the toggle on at the start is part of the
+visible setup, not a one-time configuration. Easy to forget, hard to debug
+("why isn't the agent seeing my tool?") if you don't know.
+
+#### 6. Windows filename extensions are a foot-gun
+
+When File Explorer hides extensions and you rename a file with the extension
+visible, you can end up with `.png.png` double extensions silently. Either
+turn extensions on (View → Show → File name extensions) or only rename the
+base part. The extensions-hidden default is also a security risk — malware
+named `invoice.pdf.exe` looks like `invoice.pdf` with extensions hidden.
+Worth flipping on for both reasons.
+
+### Troubleshooting reference (Evening 2 additions)
+
+| Symptom | Cause | Fix |
+|---|---|---|
+| Agent says "no file accessible" when sample_data/auth.log clearly exists | Agent confusing its own sandbox with the MCP server's local filesystem view | Use absolute paths in prompts; explicitly tell the agent to call the MCP tool rather than checking via built-in filesystem tools |
+| Connectors menu shows server but no individual tools | Working as designed — Connectors menu is server-level only; tools become visible to the agent once the server toggle is on | Flip the toggle and ask the agent to list its tools in chat to confirm |
+| `(Get-Content .env) .Length` PowerShell error | Stray space between `)` and `.Length` | `(Get-Content .env).Length` — flush, no space |
+| `(Get-Content .env).Length` returns character count instead of line count | Single-line file: PowerShell returns it as a string (with `.Length` = char count) rather than an array (with `.Length` = line count) | Use `(Get-Content .env).GetType().Name` to check; or use `Select-String -Path .env -Pattern .` to count matching lines |
+| Files saving as `.png.png` | File Explorer extensions hidden + manual rename including `.png` | Turn extensions on permanently; rename only base part next time |
+| New chat in Claude Desktop ignores tools that worked in previous chat | Connector state is per-chat | Toggle connector on in each new chat, or check Tool access settings |
+| `git status` after `git init` shows `master` instead of `main` | Git's default branch name on this machine wasn't updated despite the installer choice | `git branch -m main` to rename before first commit |
+| Pasting non-PowerShell content into PowerShell results in "not recognized as cmdlet" errors | Misread file content as command | Use `@'...'@ \| Out-File -FilePath name -Encoding utf8` here-string to write file content from PowerShell |
+
+### What's done
+
+- Two real, tested tools exposed via MCP: `parse_auth_log` and
+  `check_ip_reputation`
+- Sample data engineered to demonstrate tiered SOC reasoning
+- End-to-end agent investigation working
+- Public GitHub repo at https://github.com/plumi-cyber/mcp-security-tools
+- README optimized for hiring-manager scan
+- All secrets correctly excluded from version control
+- Build log covering both evenings
+
+### What's left
+
+- Game Bar screen recording of the agent investigation (deferred to next
+  morning for lighting and energy reasons)
+- Embed the recording in the README via a GitHub release attachment or
+  hosted link
+- Optional v2 features documented in the README's Roadmap section
+
+### Final architecture diagram
+
+The full picture, after evening 2:
+
+```
+┌──────────────────────┐         MCP protocol          ┌─────────────────────────┐
+│   Claude Desktop     │ ◄────── (stdio / JSON) ─────► │  server.py              │
+│   (MCP client)       │                               │  FastMCP from MCP SDK   │
+│                      │                               │                         │
+│  - launches server   │   "what tools do you have?"   │  @mcp.tool()            │
+│    as subprocess     │                               │  parse_auth_log()       │
+│  - reads tool list   │   "call parse_auth_log..."    │       │                 │
+│  - lets the AI       │                               │       ▼                 │
+│    decide when to    │   "result: {...}"             │   sample_data/auth.log  │
+│    call them         │                               │                         │
+│                      │   "call check_ip_reputation"  │  @mcp.tool()            │
+│                      │                               │  check_ip_reputation()  │
+│                      │   "result: {...}"             │       │                 │
+└──────────────────────┘                               └───────│─────────────────┘
+                                                               ▼
+                                                      ┌────────────────────┐
+                                                      │  AbuseIPDB API     │
+                                                      │  (HTTPS + API key) │
+                                                      └────────────────────┘
+```
+
+The agent (Claude) sits on the left. The tools sit on the right. MCP is the
+protocol slot between them. Each tool reaches out to whatever it needs in
+the real world — one to a local file, one to a third-party API.
+
+This is the pattern at the heart of every AI-augmented SOC platform.
+Substitute Claude with the platform's agent runtime, substitute the two
+tools with dozens of production security integrations, and the architecture
+is identical.
