@@ -1,8 +1,38 @@
 # MCP Security Tools
 
-A small working example of the architecture that production agentic SOC platforms (Arctic Wolf, eSentire, PointClickCare) are building on. An AI agent chaining tool calls across security data sources, with the tools, the integration, and the demo all readable in one repository.
+# MCP Security Tools
 
-Built as a portfolio piece. The server exposes two security-relevant tools to an AI agent: an SSH auth log parser and an AbuseIPDB IOC reputation lookup. The end-to-end demo shows the agent autonomously chaining both tools to investigate a hand-crafted incident and produce a tiered SOC triage report — all via the Model Context Protocol (MCP).
+You know how every company gets thousands of "someone tried to log in"
+alerts a day, and one or two people are supposed to sort through them?
+This is a small project that shows what happens when you teach an AI
+assistant to do the first pass for them — read the logs, spot what looks
+off, check whether the suspicious bits are known troublemakers, and hand
+back a prioritized summary. Built end-to-end, code public, demo video in
+the README.
+
+## Why this matters
+
+Security teams everywhere face the same problem: more alerts than humans
+can investigate. A medium-sized company can see tens of thousands of
+security events per day with only one or two analysts available to triage
+them. Most events never get a careful look.
+
+The pattern shown here — an AI agent given a small set of trusted tools
+and turned loose on first-pass investigation work — is what production
+security platforms (Arctic Wolf, eSentire, PointClickCare, Field Effect,
+and others) are building toward. The AI doesn't replace the analyst. It
+handles the repetitive 90% so the human can spend their time on the 10%
+that actually requires judgment.
+
+The setup benefits any organization that:
+
+- Generates more security alerts than it can manually review
+- Wants to free up senior analyst time for the harder cases
+- Needs broader coverage without proportionally expanding the team
+- Has security data scattered across multiple tools that need cross-checking
+
+Built as a portfolio piece for security analyst roles on agentic SOC
+platforms.
 
 ---
 
