@@ -1,7 +1,5 @@
 # MCP Security Tools
 
-# MCP Security Tools
-
 You know how every company gets thousands of "someone tried to log in"
 alerts a day, and one or two people are supposed to sort through them?
 This is a small project that shows what happens when you teach an AI
