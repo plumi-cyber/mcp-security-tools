@@ -1,12 +1,8 @@
 # MCP Security Tools
 
-A working Model Context Protocol (MCP) server that exposes two security-relevant
-tools to an AI agent. Demonstrates the AI-augmented SOC pattern: an agent
-investigating a Linux auth log, identifying suspicious sources, enriching them
-with threat intelligence, and producing a tiered triage report — all by chaining
-tool calls through a standardised protocol.
+A small working example of the architecture that production agentic SOC platforms (Arctic Wolf, eSentire, PointClickCare) are building on. An AI agent chaining tool calls across security data sources, with the tools, the integration, and the demo all readable in one repository.
 
-Built as a portfolio piece for security analyst roles on agentic SOC platforms.
+Built as a portfolio piece. The server exposes two security-relevant tools to an AI agent: an SSH auth log parser and an AbuseIPDB IOC reputation lookup. The end-to-end demo shows the agent autonomously chaining both tools to investigate a hand-crafted incident and produce a tiered SOC triage report — all via the Model Context Protocol (MCP).
 
 ---
 
