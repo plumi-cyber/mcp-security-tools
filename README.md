@@ -11,6 +11,7 @@ Built as a portfolio piece for security analyst roles on agentic SOC platforms.
 ---
 
 ## Demo
+https://github.com/user-attachments/assets/c50b81d6-ce35-463e-bb9f-dd179128041e
 
 The agent receives this prompt:
 
