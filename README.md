@@ -8,6 +8,9 @@ off, check whether the suspicious bits are known troublemakers, and hand
 back a prioritized summary. Built end-to-end, code public, demo video in
 the README.
 
+Quick note on the name MCP (Model Context Protocol): it is an agreed-upon format — like a language — that lets an AI assistant actually do things in the real world instead of just talking about them. Think of the assistant as a smart friend stuck in a sealed room — they can read, think, and explain, but they can't reach out and check anything. MCP is the slot in the wall you pass tools through. One tool to read the login records. Another to check the bad-guy list. The assistant pulls them in when it needs them and uses them like hands.
+---
+
 ## Why this matters
 
 Security teams everywhere face the same problem: more alerts than humans
