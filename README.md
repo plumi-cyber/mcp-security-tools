@@ -65,21 +65,6 @@ pattern despite low IP volume:**
 
 ---
 
-## Why this exists
-
-Modern SOC platforms increasingly use AI agents that call security tools (SIEM
-queries, threat intel lookups, EDR actions, ticketing) to automate
-investigation. The architectural pattern that makes this work is the Model
-Context Protocol — a standardised slot between the AI brain and the tools it
-operates, so any model that speaks MCP can use any tool that speaks MCP.
-
-This project is the smallest meaningful demonstration of that pattern: one
-server, two tools, a real (if scoped-down) investigation workflow. It's
-intentionally small enough to read end-to-end in 15 minutes, but rich enough
-to show what the agent–tool–threat-intel chain looks like when it works.
-
----
-
 ## What the tools do
 
 ### `parse_auth_log(filepath: str) -> dict`
